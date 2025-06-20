@@ -1,0 +1,397 @@
+npx create-next-app@latest feedback-linked --typescript --tailwind --eslint
+cd feedback-linked
+npm install @prisma/client prisma next-auth bcryptjs openai resend pusher pusher-js stripe @upstash/redis @upstash/ratelimit react-hot-toast
+npm install -D @types/bcryptjs @types/pusher-js
+DATABASE_URL="postgresql://..."
+NEXTAUTH_SECRET="your-secret-key"
+NEXTAUTH_URL="http://localhost:3000"
+
+OPENAI_API_KEY="sk-..."
+RESEND_API_KEY="re_..."
+
+PUSHER_APP_ID="xxxxxx"
+PUSHER_KEY="xxxxxxxxxx"
+PUSHER_SECRET="xxxxxxxxxx"
+PUSHER_CLUSTER="us2"
+
+STRIPE_SECRET_KEY="sk_test_..."
+STRIPE_WEBHOOK_SECRET="whsec_..."
+NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY="pk_test_..."
+
+UPSTASH_REDIS_REST_URL="https://..."
+UPSTASH_REDIS_REST_TOKEN="..."
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id            String        @id @default(cuid())
+  email         String        @unique
+  password      String
+  name          String?
+  role          Role          @default(CANDIDATE)
+  profile       Profile?
+  company       Company?      @relation(fields: [companyId], references: [id])
+  companyId     String?
+  messagesSent  Message[]     @relation("sender")
+  messagesReceived Message[]  @relation("recipient")
+  subscriptions Subscription[]
+  createdAt     DateTime      @default(now())
+  updatedAt     DateTime      @updatedAt
+}
+
+model Profile {
+  id           String     @id @default(cuid())
+  userId       String     @unique
+  user         User       @relation(fields: [userId], references: [id])
+  headline     String?
+  summary      String?
+  skills       String[]
+  experience   Json?
+  education    Json?
+  feedbackScore Float?
+  createdAt    DateTime   @default(now())
+  updatedAt    DateTime   @updatedAt
+}
+
+model Company {
+  id                 String     @id @default(cuid())
+  name               String
+  description        String?
+  logo               String?
+  website            String?
+  employees          User[]
+  jobs               Job[]
+  feedbackCompliance Float?
+  avgFeedbackRating  Float?
+  createdAt          DateTime   @default(now())
+  updatedAt          DateTime   @updatedAt
+}
+
+model Job {
+  id           String        @id @default(cuid())
+  title        String
+  description  String
+  requirements String[]
+  location     String?
+  remote       Boolean       @default(false)
+  company      Company       @relation(fields: [companyId], references: [id])
+  companyId    String
+  applications Application[]
+  createdAt    DateTime      @default(now())
+  updatedAt    DateTime      @updatedAt
+}
+
+model Application {
+  id          String     @id @default(cuid())
+  job         Job        @relation(fields: [jobId], references: [id])
+  jobId       String
+  candidate   User       @relation(fields: [userId], references: [id])
+  userId      String
+  status      ApplicationStatus @default(PENDING)
+  feedback    Feedback?
+  createdAt   DateTime   @default(now())
+  updatedAt   DateTime   @updatedAt
+}
+
+model Feedback {
+  id             String     @id @default(cuid())
+  application    Application @relation(fields: [applicationId], references: [id])
+  applicationId  String     @unique
+  reasons        String[]
+  details        String
+  helpfulness    Int?
+  isAnonymous    Boolean    @default(false)
+  aiAnalysis     Json?
+  submittedAt    DateTime   @default(now())
+}
+
+model Message {
+  id          String   @id @default(cuid())
+  content     String
+  sender      User     @relation(fields: [senderId], references: [id], name: "sender")
+  senderId    String
+  recipient   User     @relation(fields: [recipientId], references: [id], name: "recipient")
+  recipientId String
+  createdAt   DateTime @default(now())
+}
+
+model Subscription {
+  id        String   @id @default(cuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id])
+  status    String
+  expiresAt DateTime
+}
+
+enum Role {
+  CANDIDATE
+  RECRUITER
+  ADMIN
+}
+
+enum ApplicationStatus {
+  PENDING
+  REVIEWED
+  INTERVIEWING
+  REJECTED
+  ACCEPTED
+}
+npx prisma migrate dev --name init
+import NextAuth from "next-auth";
+import CredentialsProvider from "next-auth/providers/credentials";
+import { PrismaAdapter } from "@next-auth/prisma-adapter";
+import { prisma } from "@/lib/prisma";
+import bcrypt from "bcryptjs";
+
+export const authOptions = {
+  adapter: PrismaAdapter(prisma),
+  providers: [
+    CredentialsProvider({
+      name: "credentials",
+      credentials: {
+        email: { label: "Email", type: "email" },
+        password: { label: "Password", type: "password" },
+      },
+      async authorize(credentials) {
+        if (!credentials?.email || !credentials?.password) {
+          throw new Error("Invalid credentials");
+        }
+
+        const user = await prisma.user.findUnique({
+          where: { email: credentials.email },
+        });
+
+        if (!user || !user.password) {
+          throw new Error("Invalid credentials");
+        }
+
+        const isCorrectPassword = await bcrypt.compare(
+          credentials.password,
+          user.password
+        );
+
+        if (!isCorrectPassword) {
+          throw new Error("Invalid credentials");
+        }
+
+        return user;
+      },
+    }),
+  ],
+  callbacks: {
+    async jwt({ token, user }) {
+      if (user) {
+        token.role = user.role;
+        token.id = user.id;
+      }
+      return token;
+    },
+    async session({ session, token }) {
+      if (session.user) {
+        session.user.role = token.role;
+        session.user.id = token.id;
+      }
+      return session;
+    },
+  },
+  session: {
+    strategy: "jwt",
+  },
+  secret: process.env.NEXTAUTH_SECRET,
+  debug: process.env.NODE_ENV === "development",
+};
+
+const handler = NextAuth(authOptions);
+export { handler as GET, handler as POST };
+import { NextResponse } from "next/server";
+import { prisma } from "@/lib/prisma";
+import { getServerSession } from "next-auth";
+import { authOptions } from "@/app/api/auth/[...nextauth]/route";
+import { OpenAI } from "openai";
+import { sendRejectionEmail } from "@/lib/email";
+
+const openai = new OpenAI(process.env.OPENAI_API_KEY!);
+
+export async function POST(
+  request: Request,
+  { params }: { params: { id: string } }
+) {
+  const session = await getServerSession(authOptions);
+  
+  if (!session || session.user.role !== "RECRUITER") {
+    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  }
+
+  const { reasons, details, isAnonymous } = await request.json();
+
+  // Validate feedback
+  if (!reasons?.length || !details || details.length < 200) {
+    return NextResponse.json(
+      { error: "Detailed feedback (min 200 chars) and at least one reason required" },
+      { status: 400 }
+    );
+  }
+
+  try {
+    // Get application data
+    const application = await prisma.application.update({
+      where: { id: params.id },
+      data: { status: "REJECTED" },
+      include: {
+        job: { include: { company: true } },
+        candidate: true,
+      },
+    });
+
+    // AI analysis
+    const aiResponse = await openai.chat.completions.create({
+      model: "gpt-4",
+      messages: [{
+        role: "user",
+        content: `Analyze this job rejection feedback for quality:
+        Reasons: ${reasons.join(", ")}
+        Details: ${details}
+        
+        Return JSON with: qualityScore (1-10), isGeneric (boolean), improvementSuggestions (string)`
+      }],
+    });
+
+    const aiAnalysis = JSON.parse(aiResponse.choices[0].message.content || "{}");
+
+    // Create feedback
+    await prisma.feedback.create({
+      data: {
+        applicationId: params.id,
+        reasons,
+        details,
+        isAnonymous,
+        aiAnalysis,
+      },
+    });
+
+    // Send email notification
+    await sendRejectionEmail(
+      application.candidate.email,
+      `Your application for ${application.job.title} at ${application.job.company.name} was not successful.`,
+      details
+    );
+
+    // Update company compliance metrics
+    await updateCompanyMetrics(application.job.companyId);
+
+    return NextResponse.json({ success: true });
+  } catch (error) {
+    console.error(error);
+    return NextResponse.json(
+      { error: "Failed to reject application" },
+      { status: 500 }
+    );
+  }
+}
+
+async function updateCompanyMetrics(companyId: string) {
+  // Implementation omitted for brevity
+}
+import Pusher from "pusher";
+
+export const pusherServer = new Pusher({
+  appId: process.env.PUSHER_APP_ID!,
+  key: process.env.PUSHER_KEY!,
+  secret: process.env.PUSHER_SECRET!,
+  cluster: process.env.PUSHER_CLUSTER!,
+  useTLS: true,
+});
+import { NextResponse } from "next/server";
+import { pusherServer } from "@/lib/pusher";
+import { prisma } from "@/lib/prisma";
+import { getServerSession } from "next-auth";
+import { authOptions } from "@/app/api/auth/[...nextauth]/route";
+
+export async function POST(request: Request) {
+  const session = await getServerSession(authOptions);
+  if (!session) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+
+  const { recipientId, content } = await request.json();
+
+  // Save message to database
+  const message = await prisma.message.create({
+    data: {
+      content,
+      senderId: session.user.id,
+      recipientId,
+    },
+    include: {
+      sender: { select: { name: true } },
+      recipient: { select: { name: true } },
+    },
+  });
+
+  // Trigger real-time event
+  await pusherServer.trigger(`chat-${recipientId}`, "new-message", message);
+
+  return NextResponse.json(message);
+}
+"use client";
+
+import { useEffect, useState } from "react";
+import Pusher from "pusher-js";
+
+export function ChatWindow({ userId }: { userId: string }) {
+  const [messages, setMessages] = useState<Message[]>([]);
+  const [newMessage, setNewMessage] = useState("");
+
+  useEffect(() => {
+    const pusher = new Pusher(process.env.NEXT_PUBLIC_PUSHER_KEY!, {
+      cluster: process.env.NEXT_PUBLIC_PUSHER_CLUSTER!,
+    });
+
+    const channel = pusher.subscribe(`chat-${userId}`);
+    channel.bind("new-message", (message: Message) => {
+      setMessages((prev) => [...prev, message]);
+    });
+
+    return () => pusher.unsubscribe(`chat-${userId}`);
+  }, [userId]);
+
+  const sendMessage = async () => {
+    await fetch("/api/chat", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ recipientId: userId, content: newMessage }),
+    });
+    setNewMessage("");
+  };
+
+  return (
+    <div className="border rounded-lg p-4 h-96 flex flex-col">
+      <div className="flex-1 overflow-y-auto">
+        {messages.map((msg) => (
+          <div key={msg.id} className="mb-2">
+            <strong>{msg.sender.name}:</strong> {msg.content}
+          </div>
+        ))}
+      </div>
+      <div className="mt-4 flex">
+        <input
+          type="text"
+          value={newMessage}
+          onChange={(e) => setNewMessage(e.target.value)}
+          className="flex-1 border rounded-l px-3 py-2"
+          placeholder="Type a message..."
+        />
+        <button
+          onClick={sendMessage}
+          className="bg-blue-600 text-white px-4 py-2 rounded-r"
+        >
+          Send
+        </button>
+      </div>
+    </div>
+  );
+}
